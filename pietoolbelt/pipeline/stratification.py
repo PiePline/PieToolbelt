@@ -49,7 +49,7 @@ class StratificationResult(AbstractStepDirResult):
 
 
 class DatasetStratification:
-    def __init__(self, dataset: BasicDataset, calc_target_label: Callable[[Any], int], result: StratificationResult, workers_num: int = 0):
+    def __init__(self, dataset: BasicDataset, calc_target_label: Callable[[Any], Any], result: StratificationResult, workers_num: int = 0):
         self._dataset = dataset
         self._calc_label = calc_target_label
         self._progress_clbk = None
@@ -89,12 +89,61 @@ class DatasetStratification:
             hist[idxes - 1].append(i)
         return np.array([len(v) for v in hist]), hist
 
+    def cal_multi_hist(self, dataset: BasicDataset):
+        labels = []
+
+        if self._workers_num > 1:
+            with Pool(self._workers_num) as pool, tqdm(total=len(dataset)) as pbar:
+                for label in pool.imap(self._calc_label, dataset.get_items(), chunksize=self._workers_num * 10):
+                    labels.append(label)
+                    pbar.update()
+        else:
+            for d in tqdm(dataset.get_items(), total=len(dataset)):
+                labels.append(self._calc_label(d))
+
+        percent = np.percentile(np.array(labels)[:, 1], np.linspace(0, 100, 10)).tolist()
+        out_p = []
+        for p in percent:
+            if percent.index(p) % 2 != 0:
+                out_p.append(p)
+
+        hist_1 = [[] for _ in range(int(max(np.array(labels)[:, 0])) + 1)]
+        for i, idxes in enumerate(labels):
+            hist_1[int(idxes[0])].append(i)
+
+        hist_2 = [[] for _ in range(len(out_p))]
+        for i, idxes in enumerate(labels):
+            for p in range(len(out_p)):
+                if p == 0 and idxes[1] <= out_p[p]:
+                    hist_2[p].append(i)
+                elif p != 0 and out_p[p - 1] < idxes[1] <= out_p[p]:
+                    hist_2[p].append(i)
+
+        hist = [[] for _ in range(len(hist_1) * len(hist_2))]
+        z = lambda x, y: [y.index(h) if x in h else -1 for h in y]
+        for i, idxes in enumerate(labels):
+            index_h1, index_h2 = self.get_hist_idx(i, hist_1), self.get_hist_idx(i, hist_2)
+
+            if index_h2 == -1 or index_h1 == -1:
+                raise Exception("Index error in histograms")
+
+            hist[int(index_h1 * index_h2) - 1].append(i)
+
+        return np.array([len(v) for v in hist]), hist
+
     def stratificate_dataset(self, hist: np.ndarray, indices: list, parts: [float]) -> []:
         res = []
         for part in parts[:len(parts) - 1]:
             target_hist = (hist.copy() * part).astype(np.uint32)
             res.append([target_hist, self.__fill_hist(target_hist, indices)])
         res.append([np.array([len(i) for i in indices]).astype(np.uint32), {i: v for i, v in enumerate(indices)}])
+        return res
+
+    @staticmethod
+    def get_hist_idx(x, hist):
+        res = -1
+        for h in hist:
+            res = hist.index(h) if x in h else res
         return res
 
     @staticmethod
@@ -115,17 +164,17 @@ class DatasetStratification:
         self._result.add_indices(indices=inner_indices, name=path, dataset=self._dataset)
         return inner_indices
 
-    def run(self, parts: {str: float}) -> None:
+    def run(self, parts: {str: float}, multi_hist=False) -> None:
         if sum(parts.values()) > 1:
             raise RuntimeError("Sum of target parts greater than 1")
-
-        hist, indices = self.calc_hist(self._dataset)
 
         parts = [[path, part] for path, part in parts.items()]
         pathes = [p[0] for p in parts]
         parts = [p[1] for p in parts]
-        stratificated_indices = self.stratificate_dataset(hist, indices, parts)
         part_indices = {i: i for i in range(len(self._dataset))}
+
+        hist, indices = self.cal_multi_hist(self._dataset) if multi_hist else self.calc_hist(self._dataset)
+        stratificated_indices = self.stratificate_dataset(hist, indices, parts)
 
         indices_to_check = []
         for i, cur_indices in enumerate(stratificated_indices):
